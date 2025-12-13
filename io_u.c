@@ -1,3 +1,5 @@
+#include <stdint.h>
+#include <stdio.h>
 #include <unistd.h>
 #include <string.h>
 #include <assert.h>
@@ -439,6 +441,33 @@ static int get_next_block(struct thread_data *td, struct io_u *io_u,
 			if (should_do_random(td, ddir)) {
 				ret = get_next_rand_block(td, f, ddir, &b);
 				*is_random = true;
+				//zhengxd: hitchhike
+				if(td->o.hitchhike > 1){
+					int i;
+					for(i = 0; i < (td->o.hitchhike - 1); i++ ){
+						uint64_t offset_h;
+						get_next_rand_block(td, f, ddir, &offset_h);
+						io_u->hit_buf->addr[i] = offset_h * td->o.ba[ddir];
+
+						if (io_u->hit_buf->addr[i] >= f->io_size) {
+							dprint(FD_IO, "hitchhike get_next_offset: offset %llu >= io_size %llu\n",
+										(unsigned long long) io_u->offset,
+										(unsigned long long) f->io_size);
+							return 1;
+						}
+						io_u->hit_buf->addr[i-1] += f->file_offset;
+						if (io_u->hit_buf->addr[i-1] >= f->real_file_size) {
+							dprint(FD_IO, "hitchhike get_next_offset: offset %llu >= size %llu\n",
+										(unsigned long long) io_u->offset,
+										(unsigned long long) f->real_file_size);
+							return 1;
+						}
+
+					}
+					// zhengxd: index example: hitchhike - 8; hio = 7; index(max) = 6
+					io_u->hit_buf->max = i-1;
+					io_u->hit_buf->in_use = 1;
+				}
 			} else {
 				*is_random = false;
 				io_u_set(td, io_u, IO_U_F_BUSY_OK);
@@ -1895,7 +1924,6 @@ struct io_u *get_io_u(struct thread_data *td)
 			dprint(FD_IO, "get_io_u: zero buflen on %p\n", io_u);
 			goto err_put;
 		}
-
 		f->last_start[io_u->ddir] = io_u->offset;
 		f->last_pos[io_u->ddir] = io_u->offset + io_u->buflen;
 
@@ -2132,11 +2160,15 @@ static void io_completed(struct thread_data *td, struct io_u **io_u_ptr,
 		 * Make sure we notice short IO from here, and requeue them
 		 * appropriately!
 		 */
+		//zhengxd：resid is the remaining data to be transferred, ignore the remaining data in version 1.0。
 		if (bytes && io_u->resid) {
 			io_u->xfer_buflen = io_u->resid;
 			io_u->xfer_buf += bytes;
 			io_u->offset += bytes;
 			td->ts.short_io_u[io_u->ddir]++;
+			if(td->o.hitchhike){
+				printf("----A short IO is noticed in hitchhike-----\n");
+			}
 			if (io_u->offset < io_u->file->real_file_size) {
 				requeue_io_u(td, io_u_ptr);
 				return;
@@ -2145,6 +2177,10 @@ static void io_completed(struct thread_data *td, struct io_u **io_u_ptr,
 
 		td->io_blocks[ddir]++;
 		td->io_bytes[ddir] += bytes;
+		//zhengxd: verify data amount for hitchhike
+		if(td->o.hitchhike){
+			td->io_bytes_hitchhike[ddir] += bytes * (td->o.hitchhike);
+		}
 
 		if (!(io_u->flags & IO_U_F_VER_LIST)) {
 			td->this_io_blocks[ddir]++;
@@ -2158,6 +2194,11 @@ static void io_completed(struct thread_data *td, struct io_u **io_u_ptr,
 			account_io_completion(td, io_u, icd, ddir, bytes);
 
 		icd->bytes_done[ddir] += bytes;
+
+		//zhengxd: verify data amount for hitchhike
+		if(td->o.hitchhike){
+			icd->bytes_done[ddir] += bytes * (td->o.hitchhike - 1);
+		}
 
 		if (io_u->end_io) {
 			ret = io_u->end_io(td, io_u_ptr);

@@ -21,6 +21,8 @@
  *  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
  *
  */
+// #include <linux/aio_abi.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
 #include <signal.h>
@@ -32,6 +34,7 @@
 #include <pthread.h>
 
 #include "fio.h"
+#include "io_u.h"
 #include "smalloc.h"
 #include "verify.h"
 #include "diskutil.h"
@@ -1256,7 +1259,10 @@ static void cleanup_io_u(struct thread_data *td)
 
 		if (td->io_ops->io_u_free)
 			td->io_ops->io_u_free(td, io_u);
-
+		//zhengxd: free hitchhiker buffer
+		if(td->o.hitchhike){
+			free(io_u->hit_buf);
+		}
 		fio_memfree(io_u, sizeof(*io_u), td_offload_overlap(td));
 	}
 
@@ -1306,6 +1312,11 @@ static int init_io_u(struct thread_data *td)
 		INIT_FLIST_HEAD(&io_u->verify_list);
 		dprint(FD_MEM, "io_u alloc %p, index %u\n", io_u, i);
 
+		//zhengxd: allocate hitchhiker buffer
+		if(td->o.hitchhike){
+			io_u->hit_buf = calloc(1,sizeof(struct hitchhiker));
+		}
+
 		io_u->index = i;
 		io_u->flags = IO_U_F_FREE;
 		io_u_qpush(&td->io_u_freelist, io_u);
@@ -1315,7 +1326,7 @@ static int init_io_u(struct thread_data *td)
 		 * io_u buffers.
 		 */
 		io_u_qpush(&td->io_u_all, io_u);
-
+		//zhengxd: iouring io_u init
 		if (td->io_ops->io_u_init) {
 			int ret = td->io_ops->io_u_init(td, io_u);
 
@@ -1362,6 +1373,12 @@ int init_io_u_buffers(struct thread_data *td)
 	if (td_ioengine_flagged(td, FIO_NOIO) ||
 	    !(td_read(td) || td_write(td) || (td_trim(td) && td->o.num_range > 1)))
 		data_xfer = 0;
+	
+	//zhengxd: alloc hitchhiker buffer for all hitchhikers
+	if(td->o.hitchhike){
+		td->orig_buffer_size = (unsigned long long) max_bs
+					* (unsigned long long) max_units * (unsigned long long)td->o.hitchhike;
+	}
 
 	/*
 	 * if we may later need to do address alignment, then add any
@@ -1414,6 +1431,9 @@ int init_io_u_buffers(struct thread_data *td)
 		}
 		if (td_trim(td) && td->o.num_range > 1)
 			p += trim_bs;
+		//zhengxd: advance hitchhiker buffer pointer
+		else if(td->o.hitchhike)
+			p += max_bs * td->o.hitchhike;
 		else
 			p += max_bs;
 	}
@@ -2031,6 +2051,8 @@ static void *thread_main(void *data)
 	update_rusage_stat(td);
 	td->ts.total_run_time = mtime_since_now(&td->epoch);
 	for_each_rw_ddir(ddir) {
+		td->ts.hitchhike = td->o.hitchhike;
+		td->ts.io_bytes_hitchhike[ddir] = td->io_bytes_hitchhike[ddir];
 		td->ts.io_bytes[ddir] = td->io_bytes[ddir];
 	}
 

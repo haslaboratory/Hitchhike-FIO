@@ -382,6 +382,8 @@ struct thread_data {
 	uint64_t this_io_blocks[DDIR_RWDIR_CNT];
 	uint64_t io_bytes[DDIR_RWDIR_CNT];
 	uint64_t this_io_bytes[DDIR_RWDIR_CNT];
+	//zhengxd: hitcchike
+	uint64_t io_bytes_hitchhike[DDIR_RWDIR_CNT];
 	uint64_t io_skip_bytes;
 	uint64_t zone_bytes;
 	struct fio_sem *sem;

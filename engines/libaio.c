@@ -4,6 +4,7 @@
  * IO engine using the Linux native aio interface.
  *
  */
+#include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>
@@ -16,6 +17,7 @@
 #include "../optgroup.h"
 #include "../lib/memalign.h"
 #include "cmdprio.h"
+#include "hitchhike.h"
 
 /* Should be defined in newest aio_abi.h */
 #ifndef IOCB_FLAG_IOPRIO
@@ -37,6 +39,9 @@ struct libaio_data {
 	struct io_u **io_us;
 
 	struct io_u **io_u_index;
+
+	/*zhengxd: use for hitchhiker*/
+	struct hitchhiker **hit_bufs;
 
 	/*
 	 * Basic ring buffer. 'head' is incremented in _queue(), and
@@ -103,7 +108,17 @@ static int fio_libaio_prep(struct thread_data *td, struct io_u *io_u)
 	struct iocb *iocb = &io_u->iocb;
 
 	if (io_u->ddir == DDIR_READ) {
-		io_prep_pread(iocb, f->fd, io_u->xfer_buf, io_u->xfer_buflen, io_u->offset);
+		if(td->o.hitchhike){
+			io_prep_pread(iocb, f->fd, io_u->xfer_buf, (io_u->xfer_buflen) * td->o.hitchhike, io_u->offset);
+			iocb->u.c.__pad3 = io_u->xfer_buflen;
+			io_u->hit_buf->size = io_u->xfer_buflen;
+			io_u->hit_buf->iov_use = 0;
+			if(td->o.hitchhike == 1){
+				io_u->hit_buf->in_use = 0;
+			}
+		} else {
+			io_prep_pread(iocb, f->fd, io_u->xfer_buf, io_u->xfer_buflen, io_u->offset);
+		}
 		if (o->nowait)
 			iocb->aio_rw_flags |= RWF_NOWAIT;
 	} else if (io_u->ddir == DDIR_WRITE) {
@@ -268,8 +283,14 @@ static enum fio_q_status fio_libaio_queue(struct thread_data *td,
 
 	ld->iocbs[ld->head] = &io_u->iocb;
 	ld->io_us[ld->head] = io_u;
+	//zhengxd: hitchhike buffer pointer
+	if(td->o.hitchhike){
+		ld->hit_bufs[ld->head] = io_u->hit_buf;
+	}
+
 	ring_inc(ld, &ld->head, 1);
 	ld->queued++;
+
 	return FIO_Q_QUEUED;
 }
 
@@ -298,7 +319,7 @@ static void fio_libaio_queued(struct thread_data *td, struct io_u **io_us,
 		memcpy(&td->last_issue, &now, sizeof(now));
 }
 
-static int fio_libaio_commit(struct thread_data *td)
+static int fio_libaio_commit_hit(struct thread_data *td)
 {
 	struct libaio_data *ld = td->io_ops_data;
 	struct iocb **iocbs;
@@ -306,17 +327,13 @@ static int fio_libaio_commit(struct thread_data *td)
 	struct timespec ts;
 	int ret, wait_start = 0;
 
-	if (!ld->queued)
-		return 0;
-
 	do {
 		long nr = ld->queued;
 
 		nr = min((unsigned int) nr, ld->entries - ld->tail);
 		io_us = ld->io_us + ld->tail;
 		iocbs = ld->iocbs + ld->tail;
-
-		ret = io_submit(ld->aio_ctx, nr, iocbs);
+		ret = io_submit_hit(ld->aio_ctx, nr, iocbs,ld->hit_bufs);
 		if (ret > 0) {
 			fio_libaio_queued(td, io_us, ret);
 			io_u_mark_submit(td, ret);
@@ -366,6 +383,80 @@ static int fio_libaio_commit(struct thread_data *td)
 	} while (ld->queued);
 
 	return ret;
+
+}
+
+static int fio_libaio_commit(struct thread_data *td)
+{
+	struct libaio_data *ld = td->io_ops_data;
+	struct iocb **iocbs;
+	struct io_u **io_us;
+	struct timespec ts;
+	int ret, wait_start = 0;
+
+	if (!ld->queued)
+		return 0;
+	
+	if(td->o.hitchhike){
+		ret = fio_libaio_commit_hit(td);
+	} else {
+		do {
+			long nr = ld->queued;
+
+			nr = min((unsigned int) nr, ld->entries - ld->tail);
+			io_us = ld->io_us + ld->tail;
+			iocbs = ld->iocbs + ld->tail;
+
+			ret = io_submit(ld->aio_ctx, nr, iocbs);
+			if (ret > 0) {
+				fio_libaio_queued(td, io_us, ret);
+				io_u_mark_submit(td, ret);
+
+				ld->queued -= ret;
+				ring_inc(ld, &ld->tail, ret);
+				ret = 0;
+				wait_start = 0;
+			} else if (ret == -EINTR || !ret) {
+				if (!ret)
+					io_u_mark_submit(td, ret);
+				wait_start = 0;
+				continue;
+			} else if (ret == -EAGAIN) {
+				/*
+				* If we get EAGAIN, we should break out without
+				* error and let the upper layer reap some
+				* events for us. If we have no queued IO, we
+				* must loop here. If we loop for more than 30s,
+				* just error out, something must be buggy in the
+				* IO path.
+				*/
+				if (ld->queued) {
+					ret = 0;
+					break;
+				}
+				if (!wait_start) {
+					fio_gettime(&ts, NULL);
+					wait_start = 1;
+				} else if (mtime_since_now(&ts) > 30000) {
+					log_err("fio: aio appears to be stalled, giving up\n");
+					break;
+				}
+				usleep(1);
+				continue;
+			} else if (ret == -ENOMEM) {
+				/*
+				* If we get -ENOMEM, reap events if we can. If
+				* we cannot, treat it as a fatal event since there's
+				* nothing we can do about it.
+				*/
+				if (ld->queued)
+					ret = 0;
+				break;
+			} else
+				break;
+		} while (ld->queued);
+	}
+	return ret;
 }
 
 static int fio_libaio_cancel(struct thread_data *td, struct io_u *io_u)
@@ -393,6 +484,10 @@ static void fio_libaio_cleanup(struct thread_data *td)
 		free(ld->aio_events);
 		free(ld->iocbs);
 		free(ld->io_us);
+		//zhengxd: hit related
+		if(ld->hit_bufs){
+			free(ld->hit_bufs);
+		}
 		free(ld);
 	}
 }
@@ -401,7 +496,7 @@ static int fio_libaio_post_init(struct thread_data *td)
 {
 	struct libaio_data *ld = td->io_ops_data;
 	int err;
-
+	printf("----queue is %d, hitchhike is %d----\n",td->o.iodepth, td->o.hitchhike);
 	err = io_queue_init(td->o.iodepth, &ld->aio_ctx);
 	if (err) {
 		td_verror(td, -err, "io_queue_init");
@@ -418,12 +513,15 @@ static int fio_libaio_init(struct thread_data *td)
 	int ret;
 
 	ld = calloc(1, sizeof(*ld));
-
 	ld->entries = td->o.iodepth;
 	ld->is_pow2 = is_power_of_2(ld->entries);
 	ld->aio_events = calloc(ld->entries, sizeof(struct io_event));
 	ld->iocbs = calloc(ld->entries, sizeof(struct iocb *));
 	ld->io_us = calloc(ld->entries, sizeof(struct io_u *));
+
+	if(td->o.hitchhike){
+		ld->hit_bufs = calloc(ld->entries, sizeof(struct hitchhike *));
+	}
 
 	td->io_ops_data = ld;
 
@@ -445,6 +543,7 @@ FIO_STATIC struct ioengine_ops ioengine = {
 	.post_init		= fio_libaio_post_init,
 	.prep			= fio_libaio_prep,
 	.queue			= fio_libaio_queue,
+	//zhengxd: hit submit
 	.commit			= fio_libaio_commit,
 	.cancel			= fio_libaio_cancel,
 	.getevents		= fio_libaio_getevents,

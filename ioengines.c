@@ -383,6 +383,12 @@ enum fio_q_status td_io_queue(struct thread_data *td, struct io_u *io_u)
 			td->io_issue_bytes[ddir] += buflen;
 		}
 		td->rate_io_issue_bytes[ddir] += buflen;
+		if(td->o.hitchhike){
+			//zhengxd: hitchhike stat
+			td->io_issues[ddir] += (td->o.hitchhike-1);
+			td->io_issue_bytes[ddir] += buflen * (td->o.hitchhike-1);
+			td->rate_io_issue_bytes[ddir] += buflen * (td->o.hitchhike-1);
+		}
 	}
 
 	ret = td->io_ops->queue(td, io_u);
@@ -395,6 +401,11 @@ enum fio_q_status td_io_queue(struct thread_data *td, struct io_u *io_u)
 		td->io_issue_bytes[ddir] -= buflen;
 		td->rate_io_issue_bytes[ddir] -= buflen;
 		io_u_clear(td, io_u, IO_U_F_FLIGHT);
+		if(td->o.hitchhike){
+			td->io_issues[ddir] -= (td->o.hitchhike-1);
+			td->io_issue_bytes[ddir] -= buflen * (td->o.hitchhike-1);
+			td->rate_io_issue_bytes[ddir] -= buflen * (td->o.hitchhike-1);
+		}
 	}
 
 	/*
@@ -445,6 +456,7 @@ enum fio_q_status td_io_queue(struct thread_data *td, struct io_u *io_u)
 		    (ddir_sync(io_u->ddir) && td->runstate != TD_FSYNCING))
 			td->ts.total_io_u[io_u->ddir]++;
 
+		//zhengxd: submit io queue
 		if (td->io_u_queued >= td->o.iodepth_batch)
 			td_io_commit(td);
 
